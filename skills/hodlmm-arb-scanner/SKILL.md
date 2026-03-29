@@ -97,6 +97,30 @@ All outputs are JSON to stdout.
 }
 ```
 
+**watch — no alert (compact poll line):**
+```json
+{
+  "scan": 1,
+  "alert": false,
+  "xykStxPerBtc": 296698.91,
+  "dlmmStxPerBtc": "n/a",
+  "oracleStxPerBtc": 299819.37,
+  "xykVsOraclePct": -1.0408,
+  "timestamp": "2026-03-28T22:00:00.000Z"
+}
+```
+
+**watch — alert (spread exceeded threshold):**
+```json
+{ "scan": 3, "alert": true, "network": "mainnet", "pair": "sBTC/STX", "...": "full ScanResult" }
+```
+
+**watch — session start/end:**
+```json
+{ "status": "watching", "interval": "60s", "minSpread": "0.3%", "maxScans": 60, "startedAt": "..." }
+{ "status": "complete", "totalScans": 60 }
+```
+
 **Error:**
 ```json
 { "error": "descriptive message" }

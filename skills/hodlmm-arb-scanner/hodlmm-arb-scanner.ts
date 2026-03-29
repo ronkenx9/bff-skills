@@ -215,6 +215,7 @@ async function fetchXykReserves(
 
   const xBtc = xBalanceSats / 1e8;
   const yStx = yBalanceMicro / 1e6;
+  if (xBtc === 0) throw new Error("XYK pool is empty (xBalance = 0)");
   const stxPerBtc = yStx / xBtc;
   const liquidityUsd =
     xBtc * oraclePrices.btcUsd + yStx * oraclePrices.stxUsd;
@@ -271,7 +272,7 @@ async function fetchDlmmPrice(): Promise<DlmmPriceResult> {
       stxPerBtc: round(stxPerBtc, 2),
       activeBinId,
       totalBins,
-      source: "bitflow-api",
+      source: stxPerBtc > 0 ? "bitflow-api" : "unavailable",
     };
   } catch {
     return {
@@ -396,14 +397,18 @@ program
       const checks: Array<{ name: string; status: string; detail: string }> =
         [];
 
+      // Fetch oracle once; reuse result for both Pyth and XYK checks
+      let oracleResult: Awaited<ReturnType<typeof fetchOraclePrices>> | null =
+        null;
+
       // 1. Pyth Hermes
       try {
-        const oracle = await fetchOraclePrices();
-        const age = Math.round(Date.now() / 1000 - oracle.publishTime);
+        oracleResult = await fetchOraclePrices();
+        const age = Math.round(Date.now() / 1000 - oracleResult.publishTime);
         checks.push({
           name: "pyth_hermes",
           status: "ok",
-          detail: `BTC=$${oracle.btcUsd} STX=$${oracle.stxUsd} | age ${age}s | conf BTC=$${oracle.confidence.btc}`,
+          detail: `BTC=$${oracleResult.btcUsd} STX=$${oracleResult.stxUsd} | age ${age}s | conf BTC=$${oracleResult.confidence.btc}`,
         });
       } catch (e) {
         checks.push({
@@ -413,10 +418,10 @@ program
         });
       }
 
-      // 2. Hiro Stacks API (XYK pool)
+      // 2. Hiro Stacks API (XYK pool) — reuses oracle fetch from check 1
       try {
-        const oracle = await fetchOraclePrices();
-        const xyk = await fetchXykReserves(oracle);
+        if (!oracleResult) throw new Error("Oracle unavailable — skipping XYK check");
+        const xyk = await fetchXykReserves(oracleResult);
         checks.push({
           name: "hiro_xyk_pool",
           status: "ok",
