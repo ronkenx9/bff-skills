@@ -23,11 +23,7 @@ Every other Bitflow skill executes swaps without a pre-trade safety check. This 
 
 ## On-chain proof
 
-Tested on Stacks mainnet (agent address `SP3DARHJ5V40SG1QY95GV0460XPVR85726HZYGN7N`):
-
-| Operation | Txid | Result |
-|-----------|------|--------|
-| STX→sBTC swap (gate passed, score 73) | [`pending`](https://explorer.hiro.so) | Executed via MCP |
+On-chain proof pending — Bitflow API unreachable from test environment. Code handles API failure gracefully via the `doctor` subcommand.
 
 ## HODLMM integration
 
