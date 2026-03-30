@@ -41,6 +41,7 @@ When `--hodlmm-pool-id` is supplied (e.g. `dlmm_3` for the STX/sBTC pool), the l
 - **Hard impact gate:** Price impact >5% is blocked unless `--confirm-high-impact` is passed.
 - **Score threshold:** `swapScore >= 60` = `safeToSwap: true`. Score 40–59 = `warning`. Below 40 or any hard block = `blocked`.
 - **Fresh assessment on `run`:** Market data is fetched at execution time, not cached from a prior `assess` call.
+- **No credential passthrough:** `--wallet-password` is not accepted by `run`. Unlock the wallet before calling this skill. Passing credentials through MCP command output would expose them in logs and agent conversation history.
 
 ## Commands
 
@@ -78,7 +79,6 @@ bun run swap-safety-gate/swap-safety-gate.ts run \
   [--hodlmm-pool-id dlmm_3] \
   [--slippage-tolerance 0.01] \
   [--max-amount 1000] \
-  [--wallet-password <pw>] \
   [--confirm-high-impact]
 ```
 
@@ -154,7 +154,7 @@ All outputs are JSON to stdout.
 ## Known constraints
 
 - Mainnet only — Bitflow APIs do not exist on testnet.
-- `run` requires an unlocked aibtc wallet. Pass `--wallet-password` or unlock before calling.
+- `run` requires an unlocked aibtc wallet. Unlock the wallet before calling (`wallet_unlock`). The skill does not accept `--wallet-password` — credentials must never appear in MCP command output.
 - Price impact is sourced from the Bitflow quote API. If unavailable, defaults to 0 (conservative).
 - HODLMM depth scoring requires `--hodlmm-pool-id`. Without it, falls back to ticker `liquidity_in_usd` (approximate).
 - Bitflow public API: 500 req/min. No API key required.

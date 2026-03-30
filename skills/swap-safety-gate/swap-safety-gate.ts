@@ -543,7 +543,8 @@ program
   .option("--max-price-impact <pct>", "Max price impact % (default: 5.0)", String(DEFAULT_MAX_PRICE_IMPACT_PCT))
   .option("--max-amount <decimal>", `Max swap amount (default: ${DEFAULT_MAX_AMOUNT})`, String(DEFAULT_MAX_AMOUNT))
   .option("--confirm-high-impact", "Override the >5% price impact hard block")
-  .option("--wallet-password <pw>", "Unlock aibtc wallet inline for execution")
+  // NOTE: --wallet-password intentionally omitted. Unlock wallet before running this skill.
+  // Passing credentials through MCP command output risks exposure in logs and agent history.
   .action(
     async (opts: {
       tokenX: string;
@@ -554,7 +555,6 @@ program
       maxPriceImpact: string;
       maxAmount: string;
       confirmHighImpact?: boolean;
-      walletPassword?: string;
     }) => {
       try {
         const amountIn = parseFloat(opts.amountIn);
@@ -614,9 +614,6 @@ program
           amount_in: opts.amountIn,
           slippage_tolerance: parseFloat(opts.slippageTolerance),
         };
-        if (opts.walletPassword) {
-          mcpParams.wallet_password = opts.walletPassword;
-        }
         if (opts.confirmHighImpact) {
           mcpParams.confirm_high_impact = true;
         }
