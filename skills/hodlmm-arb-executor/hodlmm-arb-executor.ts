@@ -1,436 +1,864 @@
 #!/usr/bin/env bun
+/**
+ * hodlmm-arb-executor — Detects sBTC/STX spread between Bitflow XYK and HODLMM (DLMM),
+ * executes LP-based arb via MCP command objects. Entry: swap STX→sBTC on XYK + add liquidity
+ * to DLMM. Exit: withdraw from DLMM + swap sBTC→STX. Requires --confirm for live execution.
+ *
+ * Pipeline: doctor → scan → spread check → cap check → cooldown check → confirm gate → emit MCP commands → write state
+ * Exit trigger: spread reversal OR 2-hour max hold.
+ *
+ * Usage: bun run skills/hodlmm-arb-executor/hodlmm-arb-executor.ts <command> [options]
+ */
+
 import { Command } from "commander";
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
+import { deserializeCV, cvToJSON } from "@stacks/transactions";
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 
-// ============================================================================
-// CONFIGURATION & CONSTANTS
-// ============================================================================
-const STATE_FILE_PATH = path.join(os.homedir(), ".hodlmm-arb-executor-state.json");
-const COOLDOWN_MINUTES = 10;
-const ABSOLUTE_MAX_SATS = 100_000; // ~$85 max risk ceiling
-const DLMM_POOL_ID = "dlmm_3"; // Default STX/sBTC DLMM pool
-const XYK_POOL_ID = "stx-sbtc-xyk"; // Reference for spread
-const BITFLOW_API_URL = "https://app.bitflow.finance/api";
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-// Token Identifiers (Bitflow Skill Standard)
+const PYTH_HERMES = "https://hermes.pyth.network";
+const HIRO_API = "https://api.hiro.so";
+const BITFLOW_API = "https://api.bitflow.finance/api/v1";
+const FETCH_TIMEOUT_MS = 15_000;
+const NETWORK = "mainnet";
+
+// Pyth price feed IDs (mainnet)
+const PYTH_BTC_USD = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+const PYTH_STX_USD = "ec7a775f46379b5e943c3526b1c8d54cd49749176b0b98e02dde68d1bd335c17";
+
+// Bitflow XYK pool contract (sBTC/STX)
+const XYK_POOL_ADDR = "SM1793C4R5PZ4NS4VQ4WMP7SKKYVH8JZEWSZ9HCCR";
+const XYK_POOL_NAME = "xyk-pool-sbtc-stx-v-1-1";
+
+// HODLMM pool ID for sBTC/STX
+const DLMM_POOL_ID = "dlmm_3";
+
+// Token IDs (Bitflow SDK identifiers)
 const TOKEN_STX = "token-stx";
 const TOKEN_SBTC = "token-sbtc";
 
-// ============================================================================
-// STATE MANAGEMENT
-// ============================================================================
-interface ExecutionLog {
-    timestamp: string;
-    action: "ENTRY" | "EXIT";
-    grossSpreadPct: number;
-    netSpreadPct: number;
-    cappedSatsDeployed: number;
-    buyVenue: string;
-    sellVenue: string;
-    dlmmActiveBinAtEntry?: number;
-    estimatedPnlSats: number;
+// Fee estimates (bps)
+const FEE_BPS = {
+  xyk: 30,  // 0.30% Bitflow XYK fee
+  dlmm: 25, // 0.25% HODLMM fee (variable, typical)
+};
+
+// Safety limits — HARD CAPS enforced in code, not just documentation
+const MAX_AUTONOMOUS_SATS = 100_000; // 0.001 BTC (~$85 at $85k BTC) — absolute ceiling
+const DEFAULT_MAX_SATS = 100_000;
+const COOLDOWN_MS = 10 * 60 * 1000;   // 10 minutes between execute runs
+const MAX_HOLD_MS = 2 * 60 * 60 * 1000; // 2-hour max LP position hold
+const MIN_SPREAD_PCT = 0.55;           // Entry threshold: must exceed XYK (0.30%) + DLMM (0.25%) fees
+
+// State file
+const STATE_FILE = join(homedir(), ".hodlmm-arb-executor-state.json");
+const MAX_HISTORY = 50;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface PythParsedPrice {
+  id: string;
+  price: { price: string; conf: string; expo: number; publish_time: number };
+}
+
+interface OraclePrices {
+  btcUsd: number;
+  stxUsd: number;
+  stxPerBtc: number;
+  confidence: { btc: number; stx: number };
+  publishTime: number;
+}
+
+interface XykReserves {
+  xBalanceSats: number;
+  yBalanceMicro: number;
+  stxPerBtc: number;
+  liquidityUsd: number;
+}
+
+interface DlmmData {
+  stxPerBtc: number;
+  activeBinId: number;
+  totalBins: number;
+  source: "bitflow-api" | "unavailable";
+}
+
+interface McpCommand {
+  tool: string;
+  args: Record<string, unknown>;
+  description: string;
+  postConditions: string[];
+}
+
+interface LpPosition {
+  entryTimestamp: string;
+  entrySpreadPct: number;
+  entryBinId: number;
+  satsSent: number;
+  estimatedEntryUsd: number;
+}
+
+interface ExecutionRecord {
+  timestamp: string;
+  action: "entry" | "exit" | "exit-timeout" | "skipped";
+  reason: string;
+  spreadPct: number;
+  satsSent?: number;
+  commands: McpCommand[];
 }
 
 interface ExecutorState {
-    last_execution_at: string | null;
-    last_spread_pct: number;
-    open_position: {
-        active: boolean;
-        entryTimestamp: string | null;
-        dlmmBinId: number | null;
-        satsDeployed: number;
-        entrySpreadPct: number;
-    };
-    cooldown_minutes: number;
-    executions: ExecutionLog[];
-    stats: {
-        totalExecutions: number;
-        estimatedCumulativePnlSats: number;
-        avgNetSpreadPct: number;
-    };
+  version: 1;
+  lastExecutionAt: string | null;  // Only stamped when cmds.length > 0
+  lastRunAt: string;
+  openPosition: LpPosition | null;
+  history: ExecutionRecord[];
+  cumulativeEstPnlUsd: number;
 }
 
-const DEFAULT_STATE: ExecutorState = {
-    last_execution_at: null,
-    last_spread_pct: 0,
-    open_position: {
-        active: false,
-        entryTimestamp: null,
-        dlmmBinId: null,
-        satsDeployed: 0,
-        entrySpreadPct: 0
-    },
-    cooldown_minutes: COOLDOWN_MINUTES,
-    executions: [],
-    stats: {
-        totalExecutions: 0,
-        estimatedCumulativePnlSats: 0,
-        avgNetSpreadPct: 0
-    }
-};
+// ---------------------------------------------------------------------------
+// State helpers
+// ---------------------------------------------------------------------------
 
 function loadState(): ExecutorState {
-    try {
-        if (fs.existsSync(STATE_FILE_PATH)) {
-            const data = fs.readFileSync(STATE_FILE_PATH, "utf-8");
-            return JSON.parse(data) as ExecutorState;
-        }
-    } catch (e) {
-        // Silently fallback to default state on corrupted parse
-    }
-    return DEFAULT_STATE;
+  if (!existsSync(STATE_FILE)) {
+    return {
+      version: 1,
+      lastExecutionAt: null,
+      lastRunAt: new Date().toISOString(),
+      openPosition: null,
+      history: [],
+      cumulativeEstPnlUsd: 0,
+    };
+  }
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, "utf8")) as ExecutorState;
+  } catch {
+    return {
+      version: 1,
+      lastExecutionAt: null,
+      lastRunAt: new Date().toISOString(),
+      openPosition: null,
+      history: [],
+      cumulativeEstPnlUsd: 0,
+    };
+  }
 }
 
-function saveState(state: ExecutorState) {
-    try {
-        // Enforce max 50 executions log to prevent unbounded growth
-        if (state.executions.length > 50) {
-            state.executions = state.executions.slice(state.executions.length - 50);
-        }
-        fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(state, null, 2), "utf-8");
-    } catch (e) {
-        console.log(JSON.stringify({ error: "Failed to write state file." }));
-    }
+function saveState(state: ExecutorState): void {
+  if (state.history.length > MAX_HISTORY) {
+    state.history = state.history.slice(-MAX_HISTORY);
+  }
+  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
 }
 
-// ============================================================================
-// SAFETY & DOCTOR PREFLIGHT
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
-async function fetchWithTimeout(resource: RequestInfo, options: RequestInit & { timeout?: number } = {}) {
-    const { timeout = 5000 } = options;
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    const response = await fetch(resource, {
-        ...options,
-        signal: controller.signal
-    });
-    clearTimeout(id);
-    return response;
+function printJson(data: unknown): void {
+  console.log(JSON.stringify(data, null, 2));
 }
 
-// Check network endpoints to ensure the agent won't fail mid-execution
-async function runDoctor() {
-    const status: any = { pyth: false, hiro: false, bitflow: false };
-
-    try {
-        const pythRes = await fetchWithTimeout("https://hermes.pyth.network/v2/updates/price/latest?ids[]=e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43");
-        if (pythRes.ok) status.pyth = true;
-    } catch (e) { }
-
-    try {
-        const hiroRes = await fetchWithTimeout("https://api.hiro.so/v2/info");
-        if (hiroRes.ok) status.hiro = true;
-    } catch (e) { }
-
-    try {
-        const bfRes = await fetchWithTimeout(`${BITFLOW_API_URL}/pool`);
-        if (bfRes.ok) status.bitflow = true;
-    } catch (e) { }
-
-    const allPassed = status.pyth && status.hiro && status.bitflow;
-
-    if (allPassed) {
-        return { result: "ready", details: status };
-    } else {
-        throw new Error(`Doctor preflight failed. Status: ${JSON.stringify(status)}`);
-    }
+function handleError(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  printJson({ error: message });
+  process.exit(1);
 }
 
-// ============================================================================
-// MARKET DATA & SPREAD ANALYSIS
-// ============================================================================
-
-async function fetchMarketData() {
-    // 1. Pyth Oracle
-    const pythUrl = "https://hermes.pyth.network/v2/updates/price/latest?ids[]=e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
-    const pythRes = await fetchWithTimeout(pythUrl);
-    if (!pythRes.ok) throw new Error("Failed to fetch Pyth oracle data.");
-    const pythData = await pythRes.json();
-    const priceObj = pythData.parsed[0].price;
-    const oraclePrice = Number(priceObj.price) * Math.pow(10, priceObj.expo);
-
-    // 2. XYK Pool
-    const xykRes = await fetchWithTimeout(`${BITFLOW_API_URL}/pool/${XYK_POOL_ID}`);
-    if (!xykRes.ok) throw new Error("Failed to fetch XYK pool data.");
-    const xykData = await xykRes.json();
-    const stxBalance = Number(xykData.balanceX) / 1e6;
-    const sbtcBalance = Number(xykData.balanceY) / 1e8;
-    const xykPrice = stxBalance / sbtcBalance;
-
-    // 3. DLMM Pool (HODLMM)
-    const dlmmRes = await fetchWithTimeout(`${BITFLOW_API_URL}/pool/${DLMM_POOL_ID}`);
-    let dlmmPrice = oraclePrice;
-    let dlmmActiveBin = 0;
-    let dlmmAvailable = false;
-
-    if (dlmmRes.ok) {
-        dlmmAvailable = true;
-        const dlmmData = await dlmmRes.json();
-        if (dlmmData.activeBinId) {
-            dlmmActiveBin = Number(dlmmData.activeBinId);
-            dlmmPrice = Number(dlmmData.price || oraclePrice);
-        }
-    }
-
-    return { oraclePrice, xykPrice, dlmmPrice, dlmmActiveBin, dlmmAvailable };
+async function fetchJson<T>(url: string, opts?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    ...opts,
+  });
+  if (!res.ok) throw new Error(`API error ${res.status} at ${url}`);
+  return res.json() as Promise<T>;
 }
 
-// ============================================================================
-// COMMAND GENERATION & LP LOGIC
-// ============================================================================
-
-function generateEntryCommands(amountSats: number, dlmmActiveBin: number) {
-    return [
-        {
-            step: 1,
-            tool: "bitflow_swap",
-            description: `Buy ${amountSats} sats sBTC (auto-routing to optimal pool)`,
-            params: {
-                tokenX: TOKEN_STX,
-                tokenY: TOKEN_SBTC,
-                amount: amountSats,
-                slippage: 1.0
-            }
-        },
-        {
-            step: 2,
-            tool: "bitflow_hodlmm_add_liquidity",
-            description: `Deposit ${amountSats} sats sBTC into DLMM active bin ID: ${dlmmActiveBin}`,
-            params: {
-                poolId: DLMM_POOL_ID,
-                amountX: 0,
-                amountY: amountSats,
-                activeBinTolerance: 2,
-                slippageTolerance: 1.0
-            }
-        }
-    ];
+function round(n: number, decimals: number = 4): number {
+  const f = Math.pow(10, decimals);
+  return Math.round(n * f) / f;
 }
 
-function generateExitCommands(positionStats: any, currentActiveBin: number) {
-    const binOffset = positionStats.dlmmBinId ? (positionStats.dlmmBinId - currentActiveBin) : 0;
+// ---------------------------------------------------------------------------
+// Data source 1: Pyth Hermes — BTC/USD + STX/USD oracle prices
+// ---------------------------------------------------------------------------
 
-    return [
-        {
-            step: 1,
-            tool: "bitflow_hodlmm_remove_liquidity",
-            description: `Withdraw position from DLMM pool at bin offset: ${binOffset}`,
-            params: {
-                poolId: DLMM_POOL_ID,
-                binOffset: binOffset,
-                amountX: 0,
-                amountY: positionStats.satsDeployed
-            }
-        },
-        {
-            step: 2,
-            tool: "bitflow_swap",
-            description: `Sell withdrawn sBTC back to STX (auto-routing to optimal pool)`,
-            params: {
-                tokenX: TOKEN_SBTC,
-                tokenY: TOKEN_STX,
-                amount: positionStats.satsDeployed,
-                slippage: 1.0
-            }
-        }
-    ];
+async function fetchOraclePrices(): Promise<OraclePrices> {
+  const url = `${PYTH_HERMES}/v2/updates/price/latest?ids[]=${PYTH_BTC_USD}&ids[]=${PYTH_STX_USD}`;
+  const data = await fetchJson<{ parsed: PythParsedPrice[] }>(url);
+
+  if (!data.parsed || data.parsed.length < 2) {
+    throw new Error("Pyth returned fewer than 2 price feeds");
+  }
+
+  const btcFeed = data.parsed.find((p) => p.id === PYTH_BTC_USD);
+  const stxFeed = data.parsed.find((p) => p.id === PYTH_STX_USD);
+  if (!btcFeed || !stxFeed) throw new Error("Missing BTC or STX price feed from Pyth");
+
+  const btcUsd = Number(btcFeed.price.price) * Math.pow(10, btcFeed.price.expo);
+  const stxUsd = Number(stxFeed.price.price) * Math.pow(10, stxFeed.price.expo);
+  const btcConf = Number(btcFeed.price.conf) * Math.pow(10, btcFeed.price.expo);
+  const stxConf = Number(stxFeed.price.conf) * Math.pow(10, stxFeed.price.expo);
+
+  return {
+    btcUsd: round(btcUsd, 2),
+    stxUsd: round(stxUsd, 6),
+    stxPerBtc: round(btcUsd / stxUsd, 2),
+    confidence: { btc: round(btcConf, 2), stx: round(stxConf, 6) },
+    publishTime: btcFeed.price.publish_time,
+  };
 }
 
-// ============================================================================
-// EXECUTION PIPELINE
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Data source 2: Hiro Stacks API — on-chain XYK pool reserves
+// ---------------------------------------------------------------------------
 
-async function runPipeline(mode: "live" | "simulate", maxSats: number) {
-    const state = loadState();
+function decodeClarityPool(hex: string): { xBalance: bigint; yBalance: bigint } {
+  // Use @stacks/transactions deserializer — safe against field reordering.
+  // Manual hex scanning (indexOf) is fragile; deserializeCV is the correct approach.
+  const cv = deserializeCV(Buffer.from(hex, "hex"));
+  const json = cvToJSON(cv) as { value: Record<string, { value: string }> };
+  const xBalance = BigInt(json.value["x-balance"].value);
+  const yBalance = BigInt(json.value["y-balance"].value);
+  return { xBalance, yBalance };
+}
 
-    // Check 10-min cooldown
-    if (state.last_execution_at) {
-        const lastExec = new Date(state.last_execution_at);
-        const diffMins = (Date.now() - lastExec.getTime()) / (1000 * 60);
-        if (diffMins < COOLDOWN_MINUTES) {
-            console.log(JSON.stringify({
-                result: "cooldown",
-                details: { message: `Cooldown active. ${Math.ceil(COOLDOWN_MINUTES - diffMins)} minutes remaining.` }
-            }));
-            return;
-        }
+async function fetchXykReserves(oracle: OraclePrices): Promise<XykReserves> {
+  const url = `${HIRO_API}/v2/contracts/call-read/${XYK_POOL_ADDR}/${XYK_POOL_NAME}/get-pool`;
+  const data = await fetchJson<{ okay: boolean; result: string }>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sender: XYK_POOL_ADDR, arguments: [] }),
+  });
+
+  if (!data.okay) throw new Error(`Contract call failed: ${JSON.stringify(data)}`);
+
+  const hex = data.result.startsWith("0x") ? data.result.substring(2) : data.result;
+  const { xBalance, yBalance } = decodeClarityPool(hex);
+
+  const xBalanceSats = Number(xBalance);
+  const yBalanceMicro = Number(yBalance);
+  const xBtc = xBalanceSats / 1e8;
+  const yStx = yBalanceMicro / 1e6;
+  if (xBtc === 0) throw new Error("XYK pool is empty (xBalance = 0)");
+
+  return {
+    xBalanceSats,
+    yBalanceMicro,
+    stxPerBtc: round(yStx / xBtc, 2),
+    liquidityUsd: round(xBtc * oracle.btcUsd + yStx * oracle.stxUsd, 2),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Data source 3: Bitflow API — HODLMM pool bins
+// ---------------------------------------------------------------------------
+
+interface HodlmmBin {
+  bin_id: number;
+  reserve_x: string;
+  reserve_y: string;
+}
+
+interface HodlmmBinsResponse {
+  active_bin_id?: number;
+  bins: HodlmmBin[];
+}
+
+async function fetchDlmmBins(): Promise<DlmmData> {
+  try {
+    const bins = await fetchJson<HodlmmBinsResponse>(
+      `${BITFLOW_API}/hodlmm/pools/${DLMM_POOL_ID}/bins`
+    );
+
+    const activeBinId = bins.active_bin_id ?? 0;
+    const nearBins = bins.bins?.filter((b) => Math.abs(b.bin_id - activeBinId) <= 2) ?? [];
+
+    let totalX = 0;
+    let totalY = 0;
+    for (const bin of nearBins) {
+      totalX += Number(bin.reserve_x);
+      totalY += Number(bin.reserve_y);
     }
 
-    try {
-        const market = await fetchMarketData();
+    // reserve_x = sBTC sats, reserve_y = STX micro
+    const stxPerBtc = totalX > 0 ? (totalY / 1e6) / (totalX / 1e8) : 0;
 
-        // Spread calculation (e.g., if XYK is 100 and DLMM is 101, spread is 1%)
-        const spreadPct = ((market.dlmmPrice - market.xykPrice) / market.xykPrice) * 100;
-        state.last_spread_pct = spreadPct;
-
-        let commands: any[] = [];
-        let action: "ENTRY" | "EXIT" | "NONE" = "NONE";
-        let note = "";
-        let estimatedPnlSats = 0;
-
-        // Arbitrary threshold: 0.5% spread + DLMM is available
-        const SPREAD_ENTRY_THRESHOLD = 0.5;
-
-        if (state.open_position.active) {
-            // EXIT CONDITION: Spread reversed OR it has been 2 hours
-            let shouldExit = false;
-            if (spreadPct <= 0) {
-                shouldExit = true;
-                note = "Spread reversed. Exiting position.";
-            }
-
-            if (state.open_position.entryTimestamp) {
-                const entryTime = new Date(state.open_position.entryTimestamp);
-                if ((Date.now() - entryTime.getTime()) / (1000 * 60 * 60) >= 2) {
-                    shouldExit = true;
-                    note = "2-hour max position time reached. Exiting position.";
-                }
-            }
-
-            if (shouldExit) {
-                commands = generateExitCommands(state.open_position, market.dlmmActiveBin);
-                action = "EXIT";
-
-                // P&L Theoretical Approximation
-                const netSpread = state.open_position.entrySpreadPct - spreadPct;
-                estimatedPnlSats = Math.floor(state.open_position.satsDeployed * (netSpread / 100));
-            } else {
-                note = "Holding position. Exit conditions not met.";
-            }
-
-        } else if (market.dlmmAvailable && spreadPct > SPREAD_ENTRY_THRESHOLD) {
-            // ENTRY CONDITION: No open position + favorable spread
-            const deploySats = Math.min(maxSats, ABSOLUTE_MAX_SATS);
-            commands = generateEntryCommands(deploySats, market.dlmmActiveBin);
-            action = "ENTRY";
-            note = `Profitable spread detected (${spreadPct.toFixed(2)}%). Entering position.`;
-        } else {
-            note = "No profitable spread. No action taken.";
-        }
-
-        if (mode === "simulate") {
-            console.log(JSON.stringify({
-                result: "success",
-                details: {
-                    mode: "dry-run",
-                    wouldExecute: commands.length > 0,
-                    action: action,
-                    commands,
-                    estimatedPnlSats: estimatedPnlSats,
-                    note: note + " Re-run with --confirm to execute live."
-                }
-            }, null, 2));
-            return;
-        }
-
-        if (mode === "live" && commands.length > 0) {
-            // If live and commands generated, output payload and record state
-            const log: ExecutionLog = {
-                timestamp: new Date().toISOString(),
-                action: action as "ENTRY" | "EXIT",
-                grossSpreadPct: spreadPct,
-                netSpreadPct: spreadPct - 0.2, // ~0.2% approximated fee slip
-                cappedSatsDeployed: action === "ENTRY" ? maxSats : state.open_position.satsDeployed,
-                buyVenue: action === "ENTRY" ? "XYK" : "DLMM",
-                sellVenue: action === "ENTRY" ? "DLMM" : "XYK",
-                dlmmActiveBinAtEntry: market.dlmmActiveBin,
-                estimatedPnlSats: estimatedPnlSats
-            };
-
-            state.last_execution_at = log.timestamp;
-            state.executions.push(log);
-            state.stats.totalExecutions++;
-            state.stats.estimatedCumulativePnlSats += estimatedPnlSats;
-
-            if (action === "ENTRY") {
-                state.open_position = {
-                    active: true,
-                    entryTimestamp: log.timestamp,
-                    dlmmBinId: market.dlmmActiveBin,
-                    satsDeployed: maxSats,
-                    entrySpreadPct: spreadPct
-                };
-            } else {
-                state.open_position = { active: false, entryTimestamp: null, dlmmBinId: null, satsDeployed: 0, entrySpreadPct: 0 };
-            }
-
-            saveState(state);
-
-            console.log(JSON.stringify({
-                result: "success",
-                details: {
-                    mode: "live",
-                    action,
-                    log,
-                    commands: commands
-                }
-            }, null, 2));
-        } else if (mode === "live") {
-            console.log(JSON.stringify({ result: "success", details: { note: note, commands: [] } }));
-        }
-
-    } catch (e: any) {
-        console.log(JSON.stringify({ error: e.message || "Execution encountered an error." }));
-    }
+    return {
+      stxPerBtc: round(stxPerBtc, 2),
+      activeBinId,
+      totalBins: bins.bins?.length ?? 0,
+      source: stxPerBtc > 0 ? "bitflow-api" : "unavailable",
+    };
+  } catch {
+    return { stxPerBtc: 0, activeBinId: 0, totalBins: 0, source: "unavailable" };
+  }
 }
 
-// ============================================================================
-// CLI COMMANDS
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Spread analysis
+// ---------------------------------------------------------------------------
+
+interface SpreadSignal {
+  grossSpreadPct: number;
+  estFeePct: number;
+  netSpreadPct: number;
+  confidenceBuffer: number;
+  profitable: boolean;
+  xykStxPerBtc: number;
+  dlmmStxPerBtc: number;
+}
+
+function analyzeSpread(oracle: OraclePrices, xyk: XykReserves, dlmm: DlmmData): SpreadSignal | null {
+  if (dlmm.source === "unavailable" || dlmm.stxPerBtc === 0) return null;
+
+  const grossSpread = Math.abs(((xyk.stxPerBtc - dlmm.stxPerBtc) / dlmm.stxPerBtc) * 100);
+  const estFee = (FEE_BPS.xyk + FEE_BPS.dlmm) / 100;
+  const netSpread = grossSpread - estFee;
+  // Confidence buffer: STX feed uncertainty as % of price.
+  // stxPerBtc = btcUsd / stxUsd — latency between publishes creates noise.
+  const confidenceBuffer = (oracle.confidence.stx / oracle.stxUsd) * 100;
+
+  return {
+    grossSpreadPct: round(grossSpread, 4),
+    estFeePct: round(estFee, 4),
+    netSpreadPct: round(netSpread, 4),
+    confidenceBuffer: round(confidenceBuffer, 4),
+    profitable: netSpread > confidenceBuffer,
+    xykStxPerBtc: xyk.stxPerBtc,
+    dlmmStxPerBtc: dlmm.stxPerBtc,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// MCP command generation — entry
+// ---------------------------------------------------------------------------
+
+function buildEntryCommands(oracle: OraclePrices, activeBinId: number, satsCapped: number): McpCommand[] {
+  const sbtcAmount = satsCapped / 1e8;
+  const stxForSwap = round(sbtcAmount * oracle.stxPerBtc * 1.015, 6);
+
+  return [
+    {
+      tool: "bitflow_swap",
+      args: {
+        token_x: TOKEN_STX,
+        token_y: TOKEN_SBTC,
+        amount_in: String(stxForSwap),
+        slippage_tolerance: "0.015",
+      },
+      description: `Swap ${stxForSwap} STX for ~${sbtcAmount} sBTC on Bitflow XYK (entry: buy cheap sBTC)`,
+      postConditions: [
+        `FT debit STX eq ${Math.round(stxForSwap * 1e6)} micro-STX`,
+        `FT credit sBTC gte ${Math.round(satsCapped * 0.985)} sats (1.5% slippage)`,
+      ],
+    },
+    {
+      tool: "bitflow_hodlmm_add_liquidity",
+      args: {
+        pool_id: DLMM_POOL_ID,
+        bins: JSON.stringify([
+          {
+            activeBinOffset: 1,   // one bin above active = pricing at premium
+            xAmount: String(satsCapped),
+            yAmount: "0",         // one-sided sBTC deposit above active bin
+          },
+        ]),
+        active_bin_tolerance: JSON.stringify({ expectedBinId: activeBinId, maxDeviation: "2" }),
+        slippage_tolerance: "1.5",
+      },
+      description: `Add ${sbtcAmount} sBTC to DLMM pool ${DLMM_POOL_ID} bin +1 (LP entry at premium)`,
+      postConditions: [
+        `FT debit sBTC eq ${satsCapped} sats`,
+        `LP tokens credited for pool ${DLMM_POOL_ID}`,
+      ],
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// MCP command generation — exit
+// ---------------------------------------------------------------------------
+
+function buildExitCommands(position: LpPosition, currentActiveBinId: number, oracle: OraclePrices): McpCommand[] {
+  const currentOffset = position.entryBinId - currentActiveBinId;
+  const sbtcAmount = position.satsSent / 1e8;
+  const minSatsOut = Math.round(position.satsSent * 0.98);
+  const estStxOut = round(sbtcAmount * oracle.stxPerBtc * 0.985, 6);
+
+  return [
+    {
+      tool: "bitflow_hodlmm_withdraw_liquidity",
+      args: {
+        pool_id: DLMM_POOL_ID,
+        positions: JSON.stringify([
+          {
+            activeBinOffset: currentOffset,
+            amount: "100%",
+            minXAmount: String(minSatsOut),
+            minYAmount: "0",
+          },
+        ]),
+      },
+      description: `Withdraw LP from DLMM pool ${DLMM_POOL_ID} at bin offset ${currentOffset}`,
+      postConditions: [
+        `FT credit sBTC gte ${minSatsOut} sats (2% slippage buffer)`,
+        `LP tokens debited for pool ${DLMM_POOL_ID}`,
+      ],
+    },
+    {
+      tool: "bitflow_swap",
+      args: {
+        token_x: TOKEN_SBTC,
+        token_y: TOKEN_STX,
+        amount_in: String(sbtcAmount),
+        slippage_tolerance: "0.015",
+      },
+      description: `Swap ~${sbtcAmount} sBTC → ~${estStxOut} STX on Bitflow XYK (exit: realise in STX)`,
+      postConditions: [
+        `FT debit sBTC eq ${position.satsSent} sats`,
+        `FT credit STX gte ${Math.round(estStxOut * 1e6 * 0.985)} micro-STX`,
+      ],
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
 
 const program = new Command();
 
 program
-    .name("hodlmm-arb-executor")
-    .description("Evaluates the spread between Bitflow XYK and HODLMM (DLMM) for STX/sBTC, manages safe LP positioning caps, and generates valid MCP swap/liquidity commands.");
+  .name("hodlmm-arb-executor")
+  .description("Detects sBTC/STX spread and executes LP-based arb via MCP command objects");
 
+// --- doctor ---
 program
-    .command("doctor")
-    .description("Check environment readiness and API reachability")
-    .action(async () => {
-        try {
-            const res = await runDoctor();
-            console.log(JSON.stringify(res, null, 2));
-        } catch (e: any) {
-            console.log(JSON.stringify({ error: e.message }, null, 2));
-        }
-    });
+  .command("doctor")
+  .description("Preflight: check all data sources + cooldown + open position")
+  .action(async () => {
+    try {
+      const checks: Array<{ name: string; status: "ok" | "warn" | "error"; detail: string }> = [];
+      let oracleResult: OraclePrices | null = null;
 
-program
-    .command("simulate")
-    .description("Dry-run the pipeline. Outputs the actions the skill would take with --confirm.")
-    .option("--max-sats <number>", "Spend cap in sats", "100000")
-    .action(async (opts: { maxSats: string }) => {
-        const maxSats = Math.min(Number(opts.maxSats), ABSOLUTE_MAX_SATS);
-        await runPipeline("simulate", maxSats);
-    });
+      // 1. Pyth Hermes
+      try {
+        oracleResult = await fetchOraclePrices();
+        const age = Math.round(Date.now() / 1000 - oracleResult.publishTime);
+        checks.push({
+          name: "pyth_hermes",
+          status: "ok",
+          detail: `BTC=$${oracleResult.btcUsd} STX=$${oracleResult.stxUsd} | age ${age}s | conf STX=$${oracleResult.confidence.stx}`,
+        });
+      } catch (e) {
+        checks.push({ name: "pyth_hermes", status: "error", detail: e instanceof Error ? e.message : String(e) });
+      }
 
-program
-    .command("watch")
-    .description("Continuous polling. Alerts when spread exceeds minimum threshold.")
-    .option("--min-spread <number>", "Minimum spread percentage to alert", "0.5")
-    .action(async (opts: { minSpread: string }) => {
-        setInterval(async () => {
-            console.log(JSON.stringify({ result: "success", details: { status: "polling", timestamp: new Date().toISOString() } }));
-            await runPipeline("simulate", 100000); // Simulate only bounds safely
-        }, 60000); // Check every 1m
-    });
+      // 2. Hiro XYK (on-chain)
+      try {
+        if (!oracleResult) throw new Error("Oracle unavailable — skipping XYK check");
+        const xyk = await fetchXykReserves(oracleResult);
+        checks.push({
+          name: "hiro_xyk_pool",
+          status: "ok",
+          detail: `${round(xyk.stxPerBtc, 2)} STX/BTC | $${round(xyk.liquidityUsd / 1000, 1)}k TVL`,
+        });
+      } catch (e) {
+        checks.push({ name: "hiro_xyk_pool", status: "error", detail: e instanceof Error ? e.message : String(e) });
+      }
 
+      // 3. Bitflow HODLMM
+      try {
+        const dlmm = await fetchDlmmBins();
+        checks.push({
+          name: "bitflow_hodlmm",
+          status: dlmm.source === "unavailable" ? "error" : "ok",
+          detail: dlmm.source === "unavailable"
+            ? "HODLMM API unreachable — execute requires DLMM data"
+            : `${dlmm.stxPerBtc} STX/BTC | active bin ${dlmm.activeBinId} | ${dlmm.totalBins} bins`,
+        });
+      } catch (e) {
+        checks.push({ name: "bitflow_hodlmm", status: "error", detail: e instanceof Error ? e.message : String(e) });
+      }
+
+      // 4. Cooldown
+      const state = loadState();
+      const now = Date.now();
+      const lastExec = state.lastExecutionAt ? new Date(state.lastExecutionAt).getTime() : 0;
+      const cooldownRemaining = Math.max(0, COOLDOWN_MS - (now - lastExec));
+      checks.push({
+        name: "cooldown",
+        status: cooldownRemaining > 0 ? "warn" : "ok",
+        detail: cooldownRemaining > 0 ? `COOLING DOWN — ${Math.ceil(cooldownRemaining / 60000)}m remaining` : "ready",
+      });
+
+      // 5. Open position
+      if (state.openPosition) {
+        const heldMs = now - new Date(state.openPosition.entryTimestamp).getTime();
+        checks.push({
+          name: "open_position",
+          status: "warn",
+          detail: `Open LP: ${state.openPosition.satsSent} sats | held ${Math.round(heldMs / 60000)}m | timeout in ${Math.ceil((MAX_HOLD_MS - heldMs) / 60000)}m`,
+        });
+      } else {
+        checks.push({ name: "open_position", status: "ok", detail: "No open LP position" });
+      }
+
+      const hasError = checks.some((c) => c.status === "error");
+      printJson({
+        network: NETWORK,
+        status: hasError ? "error" : "ok",
+        checks,
+        note: hasError ? "PREFLIGHT_FAILED — fix errors before running execute." : "All systems go.",
+        maxAutonomousSats: MAX_AUTONOMOUS_SATS,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (hasError) process.exit(1);
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+// --- simulate ---
 program
-    .command("execute")
-    .description("Core execution. Generates live MCP commands JSON.")
-    .option("--confirm", "REQUIRED to emit live MCP commands. Without this, runs as simulate.")
-    .option("--max-sats <number>", "Spend cap in sats", "100000")
-    .action(async (opts: { confirm: boolean, maxSats: string }) => {
-        const maxSats = Math.min(Number(opts.maxSats), ABSOLUTE_MAX_SATS);
-        if (!opts.confirm) {
-            await runPipeline("simulate", maxSats);
+  .command("simulate")
+  .description("Dry-run: show what execute would do — commands, amounts, fees — no state changes")
+  .option("--max-sats <n>", "Max sBTC sats to deploy", String(DEFAULT_MAX_SATS))
+  .action(async (opts) => {
+    try {
+      const maxSats = Math.min(parseInt(opts.maxSats), MAX_AUTONOMOUS_SATS);
+
+      let oracle: OraclePrices;
+      let dlmm: DlmmData;
+      let xyk: XykReserves;
+
+      try {
+        [oracle, dlmm] = await Promise.all([fetchOraclePrices(), fetchDlmmBins()]);
+        xyk = await fetchXykReserves(oracle);
+      } catch (e) {
+        printJson({ status: "PREFLIGHT_FAILED", error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+
+      const signal = analyzeSpread(oracle, xyk, dlmm);
+      const state = loadState();
+      const now = Date.now();
+      const lastExec = state.lastExecutionAt ? new Date(state.lastExecutionAt).getTime() : 0;
+      const cooldownRemaining = Math.max(0, COOLDOWN_MS - (now - lastExec));
+
+      let entryCommands: McpCommand[] = [];
+      let exitCommands: McpCommand[] = [];
+      let wouldExecute = false;
+      let skipReason = "";
+
+      if (state.openPosition) {
+        const heldMs = now - new Date(state.openPosition.entryTimestamp).getTime();
+        const isTimeout = heldMs >= MAX_HOLD_MS;
+        const spreadReversed = !signal || !signal.profitable;
+        wouldExecute = isTimeout || spreadReversed;
+        if (wouldExecute) {
+          exitCommands = buildExitCommands(state.openPosition, dlmm.activeBinId, oracle);
         } else {
-            await runPipeline("live", maxSats);
+          skipReason = "Position open, spread still holding — no exit yet";
         }
-    });
+      } else {
+        if (!signal) {
+          skipReason = "DLMM_UNAVAILABLE — cannot evaluate spread";
+        } else if (!signal.profitable) {
+          skipReason = `Net spread ${signal.netSpreadPct}% ≤ confidence buffer ${signal.confidenceBuffer}%`;
+        } else if (signal.grossSpreadPct < MIN_SPREAD_PCT) {
+          skipReason = `Gross spread ${signal.grossSpreadPct}% < ${MIN_SPREAD_PCT}% threshold`;
+        } else if (cooldownRemaining > 0) {
+          skipReason = `Cooling down — ${Math.ceil(cooldownRemaining / 60000)}m remaining`;
+        } else {
+          wouldExecute = true;
+          entryCommands = buildEntryCommands(oracle, dlmm.activeBinId, maxSats);
+        }
+      }
+
+      printJson({
+        network: NETWORK,
+        mode: "simulate",
+        pair: "sBTC/STX",
+        oracle: { btcUsd: oracle.btcUsd, stxUsd: oracle.stxUsd, stxPerBtc: oracle.stxPerBtc },
+        xyk: { stxPerBtc: xyk.stxPerBtc },
+        dlmm: { stxPerBtc: dlmm.stxPerBtc, activeBinId: dlmm.activeBinId, source: dlmm.source },
+        spread: signal,
+        openPosition: state.openPosition,
+        wouldExecute,
+        skipReason: skipReason || null,
+        entryCommands: entryCommands.length > 0 ? entryCommands : undefined,
+        exitCommands: exitCommands.length > 0 ? exitCommands : undefined,
+        maxSats,
+        cooldownRemainingMs: cooldownRemaining,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+// --- execute ---
+program
+  .command("execute")
+  .description("Full pipeline. Requires --confirm to emit live MCP commands.")
+  .option("--confirm", "Authorize live MCP command emission (required)")
+  .option("--max-sats <n>", "Max sBTC sats to deploy", String(DEFAULT_MAX_SATS))
+  .action(async (opts) => {
+    try {
+      const confirmed = !!opts.confirm;
+      const maxSats = Math.min(parseInt(opts.maxSats), MAX_AUTONOMOUS_SATS);
+
+      // 1. CONFIRM GATE
+      if (!confirmed) {
+        printJson({
+          status: "CONFIRM_REQUIRED",
+          message: "Add --confirm to authorize MCP command emission.",
+          network: NETWORK,
+          note: `Max spend: ${maxSats} sats (hard cap: ${MAX_AUTONOMOUS_SATS} sats)`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // 2. DOCTOR-FIRST PREFLIGHT
+      let oracle: OraclePrices;
+      let dlmm: DlmmData;
+      let xyk: XykReserves;
+
+      try {
+        [oracle, dlmm] = await Promise.all([fetchOraclePrices(), fetchDlmmBins()]);
+        xyk = await fetchXykReserves(oracle);
+      } catch (e) {
+        printJson({
+          status: "PREFLIGHT_FAILED",
+          error: e instanceof Error ? e.message : String(e),
+          network: NETWORK,
+          timestamp: new Date().toISOString(),
+        });
+        process.exit(1);
+        return;
+      }
+
+      if (dlmm.source === "unavailable") {
+        printJson({
+          status: "PREFLIGHT_FAILED",
+          reason: "DLMM_UNAVAILABLE",
+          message: "HODLMM data required for execute. Run simulate or wait for Bitflow API.",
+          network: NETWORK,
+          timestamp: new Date().toISOString(),
+        });
+        process.exit(1);
+        return;
+      }
+
+      const state = loadState();
+      const now = Date.now();
+      state.lastRunAt = new Date().toISOString();
+
+      // 3. SPREAD ANALYSIS
+      const signal = analyzeSpread(oracle, xyk, dlmm);
+
+      // 4. OPEN POSITION — exit path takes priority
+      if (state.openPosition) {
+        const heldMs = now - new Date(state.openPosition.entryTimestamp).getTime();
+        const isTimeout = heldMs >= MAX_HOLD_MS;
+        const spreadReversed = !signal || !signal.profitable;
+
+        if (isTimeout || spreadReversed) {
+          const cmds = buildExitCommands(state.openPosition, dlmm.activeBinId, oracle);
+          const exitReason = isTimeout ? "exit-timeout" : "exit";
+
+          // Stamp lastExecutionAt ONLY because cmds.length > 0
+          state.lastExecutionAt = new Date().toISOString();
+          state.history.push({
+            timestamp: state.lastExecutionAt,
+            action: exitReason,
+            reason: isTimeout ? "2-hour max hold reached" : "spread reversed or unprofitable",
+            spreadPct: signal?.netSpreadPct ?? 0,
+            satsSent: state.openPosition.satsSent,
+            commands: cmds,
+          });
+          state.openPosition = null;
+          saveState(state);
+
+          printJson({
+            status: "EXIT_COMMANDS_EMITTED",
+            network: NETWORK,
+            reason: exitReason,
+            commandCount: cmds.length,
+            commands: cmds,
+            timestamp: state.lastExecutionAt,
+          });
+          return;
+        }
+
+        saveState(state);
+        printJson({
+          status: "HOLDING",
+          message: "LP position open. Spread still holds. Waiting for reversal or timeout.",
+          openPosition: state.openPosition,
+          spread: signal,
+          heldMinutes: Math.round(heldMs / 60000),
+          timeoutInMinutes: Math.ceil((MAX_HOLD_MS - heldMs) / 60000),
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // 5. ENTRY: evaluate spread
+      if (!signal || !signal.profitable) {
+        saveState(state);
+        printJson({
+          status: "SKIPPED",
+          reason: !signal ? "DLMM_UNAVAILABLE" : "SPREAD_NOT_PROFITABLE",
+          spread: signal,
+          message: !signal ? "No DLMM data." : `Net spread ${signal.netSpreadPct}% ≤ confidence buffer ${signal.confidenceBuffer}%`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      if (signal.grossSpreadPct < MIN_SPREAD_PCT) {
+        saveState(state);
+        printJson({
+          status: "SKIPPED",
+          reason: "SPREAD_TOO_SMALL",
+          spread: signal,
+          message: `Gross spread ${signal.grossSpreadPct}% < ${MIN_SPREAD_PCT}% threshold`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // 6. COOLDOWN CHECK
+      const lastExec = state.lastExecutionAt ? new Date(state.lastExecutionAt).getTime() : 0;
+      const cooldownRemaining = Math.max(0, COOLDOWN_MS - (now - lastExec));
+      if (cooldownRemaining > 0) {
+        saveState(state);
+        printJson({
+          status: "SKIPPED",
+          reason: "COOLDOWN_ACTIVE",
+          cooldownRemainingMinutes: Math.ceil(cooldownRemaining / 60000),
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // 7. EMIT ENTRY COMMANDS
+      const satsCapped = Math.min(maxSats, MAX_AUTONOMOUS_SATS);
+      const cmds = buildEntryCommands(oracle, dlmm.activeBinId, satsCapped);
+
+      // Stamp lastExecutionAt ONLY because cmds.length > 0
+      state.lastExecutionAt = new Date().toISOString();
+      state.openPosition = {
+        entryTimestamp: state.lastExecutionAt,
+        entrySpreadPct: signal.grossSpreadPct,
+        entryBinId: dlmm.activeBinId,
+        satsSent: satsCapped,
+        estimatedEntryUsd: round((satsCapped / 1e8) * oracle.btcUsd, 2),
+      };
+      state.history.push({
+        timestamp: state.lastExecutionAt,
+        action: "entry",
+        reason: `Spread ${signal.grossSpreadPct}% gross / ${signal.netSpreadPct}% net profitable`,
+        spreadPct: signal.grossSpreadPct,
+        satsSent: satsCapped,
+        commands: cmds,
+      });
+      saveState(state);
+
+      printJson({
+        status: "ENTRY_COMMANDS_EMITTED",
+        network: NETWORK,
+        spread: signal,
+        satsCapped,
+        maxAutonomousSats: MAX_AUTONOMOUS_SATS,
+        commandCount: cmds.length,
+        commands: cmds,
+        openPosition: state.openPosition,
+        timestamp: state.lastExecutionAt,
+      });
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+// --- watch ---
+program
+  .command("watch")
+  .description("Continuous polling. Alerts when spread > threshold. Always read-only.")
+  .option("--interval <seconds>", "Scan interval in seconds", "60")
+  .option("--min-spread <pct>", "Minimum spread % to trigger alert", "0.3")
+  .option("--max-scans <n>", "Max scans before exit", "60")
+  .action(async (opts) => {
+    try {
+      const interval = parseInt(opts.interval) * 1000;
+      const minSpread = parseFloat(opts.minSpread);
+      const maxScans = parseInt(opts.maxScans);
+      let scanCount = 0;
+
+      printJson({
+        status: "watching",
+        interval: `${opts.interval}s`,
+        minSpread: `${minSpread}%`,
+        maxScans,
+        startedAt: new Date().toISOString(),
+      });
+
+      while (scanCount < maxScans) {
+        scanCount++;
+        try {
+          const [oracle, dlmm] = await Promise.all([fetchOraclePrices(), fetchDlmmBins()]);
+          const xyk = await fetchXykReserves(oracle);
+          const signal = analyzeSpread(oracle, xyk, dlmm);
+          const state = loadState();
+
+          const hasAlert = signal && signal.grossSpreadPct >= minSpread;
+          if (hasAlert && signal) {
+            printJson({
+              scan: scanCount, alert: true, network: NETWORK, pair: "sBTC/STX",
+              oracle: { btcUsd: oracle.btcUsd, stxUsd: oracle.stxUsd, stxPerBtc: oracle.stxPerBtc },
+              xyk: { stxPerBtc: xyk.stxPerBtc },
+              dlmm: { stxPerBtc: dlmm.stxPerBtc, activeBinId: dlmm.activeBinId },
+              spread: signal,
+              openPosition: state.openPosition,
+              timestamp: new Date().toISOString(),
+            });
+          } else {
+            printJson({
+              scan: scanCount, alert: false,
+              xykStxPerBtc: xyk.stxPerBtc,
+              dlmmStxPerBtc: dlmm.source !== "unavailable" ? dlmm.stxPerBtc : "n/a",
+              oracleStxPerBtc: oracle.stxPerBtc,
+              grossSpreadPct: signal?.grossSpreadPct ?? null,
+              dlmmSource: dlmm.source,
+              openPosition: state.openPosition ? "yes" : "no",
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (e) {
+          printJson({ scan: scanCount, error: e instanceof Error ? e.message : String(e) });
+        }
+
+        if (scanCount < maxScans) {
+          await new Promise((r) => setTimeout(r, interval));
+        }
+      }
+
+      printJson({ status: "complete", totalScans: scanCount });
+    } catch (e) {
+      handleError(e);
+    }
+  });
 
 program.parse();
