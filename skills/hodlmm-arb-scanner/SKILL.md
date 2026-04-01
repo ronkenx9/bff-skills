@@ -92,7 +92,9 @@ All outputs are JSON to stdout.
     "estFeePct": 0.55,
     "netSpreadPct": 0.2604,
     "profitable": true,
-    "note": "Net profitable after est. fees. 0.26% edge."
+    "buyVenue": "Bitflow XYK",
+    "sellVenue": "Bitflow HODLMM",
+    "note": "Net profitable after est. fees and oracle confidence. 0.26% edge."
   }
 }
 ```

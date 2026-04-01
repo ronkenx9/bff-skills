@@ -12,6 +12,7 @@
  */
 
 import { Command } from "commander";
+import { deserializeCV, cvToJSON } from "@stacks/transactions";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -179,16 +180,32 @@ async function fetchOraclePrices(): Promise<OraclePrices> {
 // Data source 2: Hiro Stacks API — on-chain XYK pool reserves
 // ---------------------------------------------------------------------------
 
-function decodeClarityUint128(hex: string, fieldName: string): bigint {
-  // Find the field name bytes in the hex, then read the uint128 after the 0x01 prefix
-  const fieldHex = Buffer.from(fieldName, "utf8").toString("hex");
-  const idx = hex.indexOf(fieldHex);
-  if (idx === -1) throw new Error(`Field "${fieldName}" not found in response`);
+function decodeClarityPool(hex: string): { xBalance: bigint; yBalance: bigint } {
+  const cv = deserializeCV(Buffer.from(hex, "hex"));
+  const json = cvToJSON(cv) as any;
 
-  // Skip: field name bytes + 0x01 (uint type marker)
-  const valueStart = idx + fieldHex.length + 2; // +2 for "01" byte
-  const valueHex = hex.substring(valueStart, valueStart + 32); // 16 bytes = 32 hex chars
-  return BigInt("0x" + valueHex);
+  // Bitflow's (optional (tuple ...)) can result in varying JSON shapes
+  // Recursively find a key that is an object containing 'x-balance' or 'y-balance'
+  function findBalance(obj: any, keyName: string): bigint | null {
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj[keyName] && obj[keyName].value) return BigInt(obj[keyName].value);
+    if (obj.value && typeof obj.value === 'object') return findBalance(obj.value, keyName);
+    for (const k of Object.keys(obj)) {
+      const found = findBalance(obj[k], keyName);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+
+  // Try standard Bitflow keys
+  let x = findBalance(json, "x-balance") || findBalance(json, "balance-x");
+  let y = findBalance(json, "y-balance") || findBalance(json, "balance-y");
+
+  if (x === null || y === null) {
+    throw new Error(`Failed to find balances in Clarity JSON: ${JSON.stringify(json).substring(0, 200)}`);
+  }
+
+  return { xBalance: x, yBalance: y };
 }
 
 async function fetchXykReserves(
@@ -210,8 +227,9 @@ async function fetchXykReserves(
     ? data.result.substring(2)
     : data.result;
 
-  const xBalanceSats = Number(decodeClarityUint128(hex, "x-balance"));
-  const yBalanceMicro = Number(decodeClarityUint128(hex, "y-balance"));
+  const { xBalance, yBalance } = decodeClarityPool(hex);
+  const xBalanceSats = Number(xBalance);
+  const yBalanceMicro = Number(yBalance);
 
   const xBtc = xBalanceSats / 1e8;
   const yStx = yBalanceMicro / 1e6;
@@ -326,6 +344,10 @@ function calculateSpreads(
     const grossSpread = Math.abs(pct(xyk.stxPerBtc, dlmm.stxPerBtc));
     const estFee = (FEE_BPS.xyk + FEE_BPS.dlmm) / 100;
     const netSpread = grossSpread - estFee;
+    // Confidence buffer: STX feed uncertainty as % of price.
+    // Synthetic stxPerBtc combines two Pyth feeds; latency between publishes
+    // creates noise spreads. Only flag profitable if net exceeds this buffer.
+    const confidenceBuffer = (oracle.confidence.stx / oracle.stxUsd) * 100;
 
     if (grossSpread > 0.1) {
       const buyOnXyk = xyk.stxPerBtc < dlmm.stxPerBtc;
@@ -336,12 +358,14 @@ function calculateSpreads(
         grossSpreadPct: round(grossSpread, 4),
         estFeePct: round(estFee, 4),
         netSpreadPct: round(netSpread, 4),
-        profitable: netSpread > 0,
+        profitable: netSpread > confidenceBuffer,
         buyVenue: buyOnXyk ? "Bitflow XYK" : "Bitflow HODLMM",
         sellVenue: buyOnXyk ? "Bitflow HODLMM" : "Bitflow XYK",
-        note: netSpread > 0
-          ? `Net profitable after est. fees. ${round(netSpread, 2)}% edge.`
-          : `Spread exists but est. fees (${round(estFee, 2)}%) consume the edge.`,
+        note: netSpread > confidenceBuffer
+          ? `Net profitable after est. fees and oracle confidence. ${round(netSpread, 2)}% edge.`
+          : netSpread > 0
+            ? `Spread exists but within oracle confidence interval (${round(confidenceBuffer, 3)}%) — may be noise.`
+            : `Spread exists but est. fees (${round(estFee, 2)}%) consume the edge.`,
       };
     }
   } else {
@@ -357,8 +381,8 @@ function calculateSpreads(
         estFeePct: round(FEE_BPS.xyk / 100, 4),
         netSpreadPct: round(grossSpread - FEE_BPS.xyk / 100, 4),
         profitable: grossSpread > FEE_BPS.xyk / 100,
-        buyVenue: xyk.stxPerBtc < oracle.stxPerBtc ? "Bitflow XYK" : "Market",
-        sellVenue: xyk.stxPerBtc < oracle.stxPerBtc ? "Market" : "Bitflow XYK",
+        buyVenue: xyk.stxPerBtc < oracle.stxPerBtc ? "Bitflow XYK" : "Oracle Reference",
+        sellVenue: xyk.stxPerBtc < oracle.stxPerBtc ? "Oracle Reference" : "Bitflow XYK",
         note: "DLMM data unavailable — using oracle vs XYK only. Run with Bitflow API access for full HODLMM spread.",
       };
     }
