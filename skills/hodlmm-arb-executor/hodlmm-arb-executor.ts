@@ -222,11 +222,12 @@ async function fetchOraclePrices(): Promise<OraclePrices> {
 
 function decodeClarityPool(hex: string): { xBalance: bigint; yBalance: bigint } {
   // Use @stacks/transactions deserializer — safe against field reordering.
-  // Manual hex scanning (indexOf) is fragile; deserializeCV is the correct approach.
+  // get-pool returns (ok (tuple ...)) — ResponseOK wraps the tuple, so fields are at json.value.value.
   const cv = deserializeCV(Buffer.from(hex, "hex"));
-  const json = cvToJSON(cv) as { value: Record<string, { value: string }> };
-  const xBalance = BigInt(json.value["x-balance"].value);
-  const yBalance = BigInt(json.value["y-balance"].value);
+  const json = cvToJSON(cv) as { success: boolean; value: { value: Record<string, { value: string }> } };
+  const fields = json.value.value;
+  const xBalance = BigInt(fields["x-balance"].value);
+  const yBalance = BigInt(fields["y-balance"].value);
   return { xBalance, yBalance };
 }
 
