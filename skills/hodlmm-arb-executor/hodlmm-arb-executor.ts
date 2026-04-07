@@ -22,7 +22,7 @@ import { join } from "path";
 
 const PYTH_HERMES = "https://hermes.pyth.network";
 const HIRO_API = "https://api.hiro.so";
-const BITFLOW_API = "https://api.bitflow.finance/api/v1";
+const BITFLOW_QUOTES_API = "https://bff.bitflowapis.finance/api/quotes/v1";
 const FETCH_TIMEOUT_MS = 15_000;
 const NETWORK = "mainnet";
 
@@ -34,8 +34,8 @@ const PYTH_STX_USD = "ec7a775f46379b5e943c3526b1c8d54cd49749176b0b98e02dde68d1bd
 const XYK_POOL_ADDR = "SM1793C4R5PZ4NS4VQ4WMP7SKKYVH8JZEWSZ9HCCR";
 const XYK_POOL_NAME = "xyk-pool-sbtc-stx-v-1-1";
 
-// HODLMM pool ID for sBTC/STX
-const DLMM_POOL_ID = "dlmm_3";
+// HODLMM pool ID for sBTC/STX (SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-pool-stx-sbtc-v-1-bps-15)
+const DLMM_POOL_ID = "dlmm_6";
 
 // Token IDs (Bitflow SDK identifiers)
 const TOKEN_STX = "token-stx";
@@ -275,7 +275,7 @@ interface HodlmmBinsResponse {
 async function fetchDlmmBins(): Promise<DlmmData> {
   try {
     const bins = await fetchJson<HodlmmBinsResponse>(
-      `${BITFLOW_API}/hodlmm/pools/${DLMM_POOL_ID}/bins`
+      `${BITFLOW_QUOTES_API}/bins/${DLMM_POOL_ID}`
     );
 
     const activeBinId = bins.active_bin_id ?? 0;
