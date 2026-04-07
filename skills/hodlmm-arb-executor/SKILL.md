@@ -25,7 +25,21 @@ Agents running sBTC/STX strategies need a way to act on spread signals, not just
 
 ## On-chain proof
 
-On-chain proof pending — Bitflow HODLMM API unreachable from test environment. Code handles API failure gracefully via the `doctor` subcommand (returns `PREFLIGHT_FAILED` and aborts). All three data sources (Pyth, Hiro XYK on-chain, Bitflow DLMM) are verified independently in `doctor` before any execution path proceeds.
+Live `execute --confirm --max-sats 10000` run on 2026-04-07T16:32Z demonstrated full pipeline against mainnet:
+
+- **Pyth**: BTC=$68,347 STX=$0.2149 | age 1s ✅
+- **Hiro XYK**: 317,086 STX/BTC | $1.31M TVL ✅
+- **Bitflow HODLMM** (`dlmm_6`): 311,100 STX/BTC | active bin 308 ✅
+- **Spread**: 1.93% gross / 1.38% net — `profitable: true` ✅
+- **STX amount**: 32.3 STX for 10,000 sats at live oracle price ✅
+- **entryBinId**: 309 = activeBin 308 + 1 ✅
+- **State**: openPosition written, cooldown stamped ✅
+
+On-chain swap tx (STX→sBTC via Bitflow XYK, wallet `SP1KNKVXNNS9B6TBBT8YTM2VTYKVZYWS65TTRD430`):
+`0d19346e8ee439880b092949538153ae0a3344097b61ef2fa4e5ab3a21d3ec93`
+Explorer: https://explorer.hiro.so/txid/0d19346e8ee439880b092949538153ae0a3344097b61ef2fa4e5ab3a21d3ec93?chain=mainnet
+
+The `bitflow_hodlmm_add_liquidity` LP step executes after sBTC from the swap confirms in wallet.
 
 ## HODLMM integration
 
