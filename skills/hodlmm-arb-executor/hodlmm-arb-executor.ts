@@ -23,6 +23,7 @@ import { join } from "path";
 const PYTH_HERMES = "https://hermes.pyth.network";
 const HIRO_API = "https://api.hiro.so";
 const BITFLOW_QUOTES_API = "https://bff.bitflowapis.finance/api/quotes/v1";
+const BITFLOW_API_KEY = process.env.BITFLOW_API_KEY ?? "";
 const FETCH_TIMEOUT_MS = 15_000;
 const NETWORK = "mainnet";
 
@@ -276,21 +277,17 @@ interface HodlmmBinsResponse {
 async function fetchDlmmBins(): Promise<DlmmData> {
   try {
     const bins = await fetchJson<HodlmmBinsResponse>(
-      `${BITFLOW_QUOTES_API}/bins/${DLMM_POOL_ID}`
+      `${BITFLOW_QUOTES_API}/bins/${DLMM_POOL_ID}`,
+      BITFLOW_API_KEY ? { headers: { "x-api-key": BITFLOW_API_KEY } } : undefined
     );
 
     const activeBinId = bins.active_bin_id ?? 0;
-    const nearBins = bins.bins?.filter((b) => Math.abs(b.bin_id - activeBinId) <= 2) ?? [];
+    const activeBin = bins.bins?.find((b) => b.bin_id === activeBinId);
 
-    let totalX = 0;
-    let totalY = 0;
-    for (const bin of nearBins) {
-      totalX += Number(bin.reserve_x);
-      totalY += Number(bin.reserve_y);
-    }
-
-    // reserve_x = sBTC sats, reserve_y = STX micro
-    const stxPerBtc = totalX > 0 ? (totalY / 1e6) / (totalX / 1e8) : 0;
+    // price field from the API is in nano-STX per satoshi.
+    // Convert to STX/BTC: (nano-STX/sat) × 10 = (STX×1e-9 / BTC×1e-8) × 10 = STX/BTC
+    const rawPrice = activeBin ? Number((activeBin as any).price) : 0;
+    const stxPerBtc = rawPrice * 10;
 
     return {
       stxPerBtc: round(stxPerBtc, 2),
@@ -481,9 +478,11 @@ program
         const dlmm = await fetchDlmmBins();
         checks.push({
           name: "bitflow_hodlmm",
-          status: dlmm.source === "unavailable" ? "error" : "ok",
+          status: dlmm.source === "unavailable" ? (!BITFLOW_API_KEY ? "warn" : "error") : "ok",
           detail: dlmm.source === "unavailable"
-            ? "HODLMM API unreachable — execute requires DLMM data"
+            ? (!BITFLOW_API_KEY
+                ? "BITFLOW_API_KEY env var not set — set it to enable DLMM spread detection"
+                : "HODLMM API unreachable — execute requires DLMM data")
             : `${dlmm.stxPerBtc} STX/BTC | active bin ${dlmm.activeBinId} | ${dlmm.totalBins} bins`,
         });
       } catch (e) {
