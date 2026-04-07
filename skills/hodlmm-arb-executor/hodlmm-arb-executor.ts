@@ -285,8 +285,11 @@ async function fetchDlmmBins(): Promise<DlmmData> {
     const activeBinId = bins.active_bin_id ?? 0;
     const activeBin = bins.bins?.find((b) => b.bin_id === activeBinId);
 
-    // price field from the API is in nano-STX per satoshi.
-    // Convert to STX/BTC: (nano-STX/sat) × 10 = (STX×1e-9 / BTC×1e-8) × 10 = STX/BTC
+    // price field unit verified empirically against Pyth oracle (2026-04-07):
+    //   dlmm_6 active bin 301, price = "30785" → 30785 × 10 = 307,850 STX/BTC
+    //   Pyth oracle implied: $68,892 / $0.2178 = 316,309 STX/BTC (~2.7% spread)
+    // Multiplier is 10. Arc0btc note: nano-STX/sat algebra gives ×0.1 (=3,078),
+    // which does not match — the field is in a Bitflow-internal unit, not nano-STX/sat.
     const rawPrice = activeBin?.price ? Number(activeBin.price) : 0;
     const stxPerBtc = rawPrice * 10;
 
@@ -387,6 +390,8 @@ function buildEntryCommands(oracle: OraclePrices, activeBinId: number, satsCappe
 // ---------------------------------------------------------------------------
 
 function buildExitCommands(position: LpPosition, currentActiveBinId: number, oracle: OraclePrices): McpCommand[] {
+  // entryBinId stores the actual LP bin (activeBin + 1 at entry time).
+  // currentOffset = LP bin relative to current active bin.
   const currentOffset = position.entryBinId - currentActiveBinId;
   const sbtcAmount = position.satsSent / 1e8;
   const minSatsOut = Math.round(position.satsSent * 0.98);
@@ -477,6 +482,10 @@ program
       // 3. Bitflow HODLMM
       try {
         const dlmm = await fetchDlmmBins();
+        // Calibration: log rawPrice alongside computed stxPerBtc so unit can be
+        // verified against oracle. Raw bin price × 10 = stxPerBtc (empirically verified
+        // 2026-04-07: bin 301 price "30785" → 307,850 STX/BTC vs oracle 316,309, ~2.7% spread).
+        const oracleImplied = oracleResult ? round(oracleResult.btcUsd / oracleResult.stxUsd, 2) : 0;
         checks.push({
           name: "bitflow_hodlmm",
           status: dlmm.source === "unavailable" ? (!BITFLOW_API_KEY ? "warn" : "error") : "ok",
@@ -484,7 +493,7 @@ program
             ? (!BITFLOW_API_KEY
                 ? "BITFLOW_API_KEY env var not set — set it to enable DLMM spread detection"
                 : "HODLMM API unreachable — execute requires DLMM data")
-            : `${dlmm.stxPerBtc} STX/BTC | active bin ${dlmm.activeBinId} | ${dlmm.totalBins} bins`,
+            : `${dlmm.stxPerBtc} STX/BTC | active bin ${dlmm.activeBinId} | ${dlmm.totalBins} bins | oracle implied ${oracleImplied} STX/BTC`,
         });
       } catch (e) {
         checks.push({ name: "bitflow_hodlmm", status: "error", detail: e instanceof Error ? e.message : String(e) });
@@ -764,7 +773,7 @@ program
       state.openPosition = {
         entryTimestamp: state.lastExecutionAt,
         entrySpreadPct: signal.grossSpreadPct,
-        entryBinId: dlmm.activeBinId,
+        entryBinId: dlmm.activeBinId + 1, // LP deposited at activeBinOffset: +1
         satsSent: satsCapped,
         estimatedEntryUsd: round((satsCapped / 1e8) * oracle.btcUsd, 2),
       };
