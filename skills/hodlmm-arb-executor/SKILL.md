@@ -36,10 +36,10 @@ Live `execute --confirm --max-sats 10000` run on 2026-04-07T16:32Z demonstrated 
 - **State**: openPosition written, cooldown stamped ✅
 
 On-chain swap tx (STX→sBTC via Bitflow XYK, wallet `SP1KNKVXNNS9B6TBBT8YTM2VTYKVZYWS65TTRD430`):
-`0d19346e8ee439880b092949538153ae0a3344097b61ef2fa4e5ab3a21d3ec93`
-Explorer: https://explorer.hiro.so/txid/0d19346e8ee439880b092949538153ae0a3344097b61ef2fa4e5ab3a21d3ec93?chain=mainnet
+`a34388332765330ff0299e598757078c7512c0db8dfd7dd96737b6ba9753e424` — **SUCCESS** `(ok u10064)` — 10,064 sats sBTC received.
+Explorer: https://explorer.hiro.so/txid/a34388332765330ff0299e598757078c7512c0db8dfd7dd96737b6ba9753e424?chain=mainnet
 
-The `bitflow_hodlmm_add_liquidity` LP step executes after sBTC from the swap confirms in wallet.
+Post-conditions: STX eq 32,300,024 micro-STX (debit from wallet) + sbtc-token gte 9,850 sats (sent from pool). 32.3 STX debited, 10,064 sats received. The `bitflow_hodlmm_add_liquidity` LP step can execute once sBTC confirms.
 
 ## HODLMM integration
 
