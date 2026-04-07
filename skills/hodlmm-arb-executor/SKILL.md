@@ -7,8 +7,8 @@ metadata:
   user-invocable: "true"
   arguments: "doctor | simulate | execute | watch"
   entry: "hodlmm-arb-executor/hodlmm-arb-executor.ts"
-  requires: ""
-  tags: "defi, hodlmm, mainnet-only, l2, write-capable, lp"
+  requires: "wallet"
+  tags: "defi, write, mainnet-only, requires-funds, l2"
 ---
 
 # HODLMM Arb Executor
@@ -29,7 +29,7 @@ On-chain proof pending — Bitflow HODLMM API unreachable from test environment.
 
 ## HODLMM integration
 
-Uses `bitflow_hodlmm_add_liquidity` for entry and `bitflow_hodlmm_withdraw_liquidity` for exit. Targets `dlmm_3` (sBTC/STX pool). Bonus-eligible for HODLMM integration prize.
+Uses `bitflow_hodlmm_add_liquidity` for entry and `bitflow_hodlmm_withdraw_liquidity` for exit. Targets `dlmm_6` (`SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-pool-stx-sbtc-v-1-bps-15`, the STX/sBTC DLMM pool). Bonus-eligible for HODLMM integration prize.
 
 ## Safety notes
 
@@ -121,9 +121,9 @@ All outputs are JSON to stdout.
     },
     {
       "tool": "bitflow_hodlmm_add_liquidity",
-      "args": { "pool_id": "dlmm_3", "bins": "[{\"activeBinOffset\":1,\"xAmount\":\"100000\",\"yAmount\":\"0\"}]", "active_bin_tolerance": "{\"expectedBinId\":500,\"maxDeviation\":\"2\"}", "slippage_tolerance": "1.5" },
-      "description": "Add 0.001 sBTC to DLMM pool dlmm_3 bin +1 (LP entry at premium)",
-      "postConditions": ["FT debit sBTC eq 100000 sats", "LP tokens credited for pool dlmm_3"]
+      "args": { "pool_id": "dlmm_6", "bins": "[{\"activeBinOffset\":1,\"xAmount\":\"100000\",\"yAmount\":\"0\"}]", "active_bin_tolerance": "{\"expectedBinId\":500,\"maxDeviation\":\"2\"}", "slippage_tolerance": "1.5" },
+      "description": "Add 0.001 sBTC to DLMM pool dlmm_6 bin +1 (LP entry at premium)",
+      "postConditions": ["FT debit sBTC eq 100000 sats", "LP tokens credited for pool dlmm_6"]
     }
   ],
   "maxSats": 100000,

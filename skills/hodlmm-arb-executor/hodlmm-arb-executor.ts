@@ -267,6 +267,7 @@ interface HodlmmBin {
   bin_id: number;
   reserve_x: string;
   reserve_y: string;
+  price?: string;
 }
 
 interface HodlmmBinsResponse {
@@ -286,7 +287,7 @@ async function fetchDlmmBins(): Promise<DlmmData> {
 
     // price field from the API is in nano-STX per satoshi.
     // Convert to STX/BTC: (nano-STX/sat) × 10 = (STX×1e-9 / BTC×1e-8) × 10 = STX/BTC
-    const rawPrice = activeBin ? Number((activeBin as any).price) : 0;
+    const rawPrice = activeBin?.price ? Number(activeBin.price) : 0;
     const stxPerBtc = rawPrice * 10;
 
     return {
@@ -535,7 +536,7 @@ program
   .option("--max-sats <n>", "Max sBTC sats to deploy", String(DEFAULT_MAX_SATS))
   .action(async (opts) => {
     try {
-      const maxSats = Math.min(parseInt(opts.maxSats), MAX_AUTONOMOUS_SATS);
+      const maxSats = Math.min(parseInt(opts.maxSats) || DEFAULT_MAX_SATS, MAX_AUTONOMOUS_SATS);
 
       let oracle: OraclePrices;
       let dlmm: DlmmData;
@@ -616,7 +617,7 @@ program
   .action(async (opts) => {
     try {
       const confirmed = !!opts.confirm;
-      const maxSats = Math.min(parseInt(opts.maxSats), MAX_AUTONOMOUS_SATS);
+      const maxSats = Math.min(parseInt(opts.maxSats) || DEFAULT_MAX_SATS, MAX_AUTONOMOUS_SATS);
 
       // 1. CONFIRM GATE
       if (!confirmed) {
@@ -802,9 +803,9 @@ program
   .option("--max-scans <n>", "Max scans before exit", "60")
   .action(async (opts) => {
     try {
-      const interval = parseInt(opts.interval) * 1000;
-      const minSpread = parseFloat(opts.minSpread);
-      const maxScans = parseInt(opts.maxScans);
+      const interval = (parseInt(opts.interval) || 60) * 1000;
+      const minSpread = parseFloat(opts.minSpread) || MIN_SPREAD_PCT;
+      const maxScans = parseInt(opts.maxScans) || 60;
       let scanCount = 0;
 
       printJson({
