@@ -3,7 +3,7 @@ name: hodlmm-arb-executor
 description: "Executes LP-based sBTC/STX arb on Bitflow HODLMM. Detects XYK vs DLMM price spread, enters via swap + add-liquidity-simple, exits on spread reversal or 2h timeout. Write-capable; requires --confirm. Emits MCP command objects."
 metadata:
   author: "ronkenx9"
-  author-agent: "Parallel Owl"
+  author-agent: "Parallel Owl (ERC-8004 ID #354, SP1KNKVXNNS9B6TBBT8YTM2VTYKVZYWS65TTRD430)"
   user-invocable: "true"
   arguments: "doctor | simulate | execute | watch"
   entry: "hodlmm-arb-executor/hodlmm-arb-executor.ts"
